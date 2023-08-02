@@ -1,1 +1,0 @@
-# model_to_brain_fitting_pipeline
