@@ -1,0 +1,212 @@
+import argparse
+from typing import Optional, List, Union
+from datetime import datetime
+import numpy as np
+import nibabel.freesurfer.mghformat as mgh
+import h5py
+
+import sys
+import os
+
+sys.path.append("..")
+
+from paths import *
+from constants import *
+
+sys.path.append(CODE_PATH)
+from utils.fit_utils import get_indices
+import utils.regression_utils as rutils
+from fit import extract_and_fit
+
+
+def log(to_print: str):
+    print(f"\nLOG: {to_print}")
+
+
+def resolve_area(areas: List[str], arg_area: Optional[str]):
+    """
+    Prefers sherlock SLURM_ARRAY_TASK_ID but will return command line arg if not available
+    """
+    task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    if task_id is not None:
+        return areas[int(task_id)]
+
+    return arg_area
+
+
+def main(
+    subj,
+    hemi,
+    roi,
+    area,
+    model_name,
+    model_layer_strings,
+    subsample,
+    mapping_func,
+    CV,
+    pretrained,
+    reduce_temporal_dims,
+    return_weights,
+):
+
+    area = resolve_area(ROI_NAMES[1:], area)
+
+    betas = h5py.File(
+        LOCALDATA_PATH
+        + "processed/organized_betas_by_area/subj"
+        + subj
+        + "_"
+        + hemi
+        + "_"
+        + roi
+        + "_"
+        + area
+        + ".hdf5",
+        "r",
+    )
+
+    # indexing
+    beta_order, beta_mask, validation_mask = get_indices(subj)
+    num_train = int((8 / 9) * (beta_order.shape[0] - np.sum(validation_mask)))
+    num_test = int((1 / 9) * (beta_order.shape[0] - np.sum(validation_mask)))
+
+    # sort betas
+    indx = beta_order.argsort(axis=0)
+    betas = np.array(betas[area])[beta_mask, :]  # returns only images with all 3 trials
+    sorted_betas = betas[indx, :]
+
+    # all splits for regression training
+    num_splits = 2  # average over two random splits
+    all_splits = rutils.get_splits(
+        data=sorted_betas,
+        split_index=0,
+        num_splits=num_splits,
+        num_per_class_test=num_test,
+        num_per_class_train=num_train,
+        exclude=validation_mask,
+    )
+
+    if return_weights == 1:
+        return_weights = True
+    else:
+        return_weights = False
+
+    rsquared_array = extract_and_fit(
+        subj,
+        model_name,
+        model_layer_strings,
+        subsample,
+        mapping_func,
+        CV,
+        sorted_betas,
+        beta_order,
+        all_splits,
+        pretrained,
+        reduce_temporal_dims,
+        return_weights,
+    )
+
+    # save to local data folder
+    stem = (
+        RESULTS_PATH
+        + "fits_by_area/subj"
+        + subj
+        + "_"
+        + hemi
+        + "_"
+        + roi
+        + "_"
+        + area
+        + "_"
+        + model_name
+        + (
+            str(reduce_temporal_dims)
+            if model_name == "slowfast" or model_name == "slowfast_full"
+            else ""
+        )
+        + "_"
+        + mapping_func
+        + "_subsample_"
+        + str(subsample)
+        + "_"
+        + str(CV)
+        + "CV_"
+        + str(pretrained)
+        + "pretraining"
+    )
+
+    # Save weights
+    if return_weights:
+        log("Saving weights")
+        (rsquared_array, weights) = rsquared_array  # unpack
+        weights_h5f = h5py.File(
+            stem + "_weights.hdf5",
+            "w",
+        )
+        for k, v in weights.items():
+            print(str(k))
+            weights_h5f.create_dataset(str(k), data=v)
+        weights_h5f.close()
+        del weights
+
+    # Save fits
+    log("Saving fits")
+    h5f = h5py.File(
+        stem + "_fits.hdf5",
+        "w",
+    )
+    for k, v in rsquared_array.items():
+        print(str(k))
+        h5f.create_dataset(str(k), data=v)
+    h5f.close()
+    del rsquared_array
+
+    log("All done!")
+    log(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+if __name__ == "__main__":
+    # Parse command line args
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--subj", type=str)
+    parser.add_argument("--hemi", type=str, default="rh")
+    parser.add_argument("--roi", type=str, default="streams_shrink10")
+    parser.add_argument(
+        "--area", default=None
+    )  # particular area to evaluate, or None if using SLURM task ids
+    parser.add_argument("--model_name", type=str, default="alexnet")
+    parser.add_argument(
+        "--model_layer_strings", type=Optional[Union[str, List[str]]], default=None
+    )
+    parser.add_argument(
+        "--subsample", type=int, default=1
+    )  # subsample the features randomly (1) or using PCA (2)
+    parser.add_argument(
+        "--mapping_func", type=str, default="PLS"
+    )  # which mapping function to use
+    parser.add_argument("--CV", type=int, default=0)  # cross-validated (1) or not (0)
+    parser.add_argument(
+        "--pretrained", type=int, default=1
+    )  # pretrained network (1) or not (0)
+    parser.add_argument(
+        "--reduce_temporal_dims", type=int, default=0
+    )  # if video network, reduce along temporal dimension (1) or not (0)
+    parser.add_argument(
+        "--return_weights", type=int, default=0
+    )  # return regression weights (1) or not(0)
+    ARGS, _ = parser.parse_known_args()
+
+    main(
+        ARGS.subj,
+        ARGS.hemi,
+        ARGS.roi,
+        ARGS.area,
+        ARGS.model_name,
+        ARGS.model_layer_strings,
+        ARGS.subsample,
+        ARGS.mapping_func,
+        ARGS.CV,
+        ARGS.pretrained,
+        ARGS.reduce_temporal_dims,
+        ARGS.return_weights,
+    )
